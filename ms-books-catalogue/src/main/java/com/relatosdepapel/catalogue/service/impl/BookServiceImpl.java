@@ -1,15 +1,21 @@
 package com.relatosdepapel.catalogue.service.impl;
 
+import com.relatosdepapel.catalogue.document.BookDocument;
 import com.relatosdepapel.catalogue.dto.BookDTO;
 import com.relatosdepapel.catalogue.entity.Book;
 import com.relatosdepapel.catalogue.repository.BookRepository;
+import com.relatosdepapel.catalogue.repository.BookSearchRepository;
 import com.relatosdepapel.catalogue.service.BookService;
+import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+import org.springframework.data.elasticsearch.core.SearchHit;
+import org.springframework.data.elasticsearch.core.query.Criteria;
+import org.springframework.data.elasticsearch.core.query.CriteriaQuery;
 import org.springframework.stereotype.Service;
 
-import jakarta.persistence.criteria.Predicate;
-import java.util.ArrayList;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 
 @Service
@@ -18,9 +24,15 @@ public class BookServiceImpl implements BookService {
     private static final String BOOK_NOT_FOUND = "Book not found";
 
     private final BookRepository repository;
+    private final BookSearchRepository searchRepository;
+    private final ElasticsearchOperations elasticsearchOperations;
 
-    public BookServiceImpl(BookRepository repository) {
+    public BookServiceImpl(BookRepository repository,
+                          BookSearchRepository searchRepository,
+                          ElasticsearchOperations elasticsearchOperations) {
         this.repository = repository;
+        this.searchRepository = searchRepository;
+        this.elasticsearchOperations = elasticsearchOperations;
     }
 
 
@@ -30,6 +42,7 @@ public class BookServiceImpl implements BookService {
     public BookDTO create(BookDTO bookDTO) {
         Book book = mapToEntity(bookDTO);
         Book saved = repository.save(book);
+        indexBook(saved);
         return mapToDTO(saved);
     }
 
@@ -47,11 +60,13 @@ public class BookServiceImpl implements BookService {
         existing.setPrice(bookDTO.getPrice());
         existing.setStock(bookDTO.getStock());
         existing.setCategory(bookDTO.getCategory());
-        existing.setPublicationDate(bookDTO.getPublicationDate());
+        existing.setPublicationYear(bookDTO.getPublicationDate() != null ? bookDTO.getPublicationDate().getYear() : null);
         existing.setRating(bookDTO.getRating());
         existing.setVisible(bookDTO.getVisible());
 
-        return mapToDTO(repository.save(existing));
+        Book saved = repository.save(existing);
+        indexBook(saved);
+        return mapToDTO(saved);
     }
 
 
@@ -70,17 +85,17 @@ public class BookServiceImpl implements BookService {
                 case "price" -> existing.setPrice(new java.math.BigDecimal(value.toString()));
                 case "stock" -> existing.setStock((Integer) value);
                 case "category" -> existing.setCategory((String) value);
-                case "publicationDate" ->
-                        existing.setPublicationDate(java.time.LocalDate.parse(value.toString()));
-                case "rating" -> existing.setRating((Integer) value);
-                case "visible" -> existing.setVisible((Boolean) value);
-                default -> {
-                    // campo desconocido
-                }
+                case "publicationDate" -> existing.setPublicationYear(LocalDate.parse(value.toString()).getYear());
+                case "publicationYear" -> existing.setPublicationYear(value instanceof Number n ? n.intValue() : Integer.parseInt(value.toString()));
+                case "rating" -> existing.setRating(value instanceof Number n ? n.intValue() : Integer.parseInt(value.toString()));
+                case "visible" -> existing.setVisible(Boolean.parseBoolean(value.toString()));
+                default -> { /* campo desconocido */ }
             }
         });
 
-        return mapToDTO(repository.save(existing));
+        Book saved = repository.save(existing);
+        indexBook(saved);
+        return mapToDTO(saved);
     }
 
 
@@ -89,6 +104,7 @@ public class BookServiceImpl implements BookService {
     @Override
     public void delete(Long id) {
         repository.deleteById(id);
+        searchRepository.deleteById(id);
     }
 
 
@@ -106,62 +122,104 @@ public class BookServiceImpl implements BookService {
 
     @Override
     public List<BookDTO> findAllVisible() {
-        return repository.findAll()
-                .stream()
+        return repository.findAll().stream()
                 .filter(book -> Boolean.TRUE.equals(book.getVisible()))
                 .map(this::mapToDTO)
                 .toList();
     }
 
 
-    // Buscar
+    // Buscar (Elasticsearch; ya no usa base de datos relacional)
 
     @Override
     public List<BookDTO> search(String title, String author, String isbn,
                                 String category, Integer rating, Boolean visible) {
 
-        return repository.findAll((root, query, cb) -> {
+        Criteria criteria = null;
 
-            List<Predicate> predicates = new ArrayList<>();
+        if (title != null && !title.isBlank()) {
+            criteria = criteria == null
+                    ? Criteria.where("title").contains(title)
+                    : criteria.and(Criteria.where("title").contains(title));
+        }
+        if (author != null && !author.isBlank()) {
+            criteria = criteria == null
+                    ? Criteria.where("author").contains(author)
+                    : criteria.and(Criteria.where("author").contains(author));
+        }
+        if (isbn != null && !isbn.isBlank()) {
+            criteria = criteria == null
+                    ? Criteria.where("isbn").is(isbn)
+                    : criteria.and(Criteria.where("isbn").is(isbn));
+        }
+        if (category != null && !category.isBlank()) {
+            criteria = criteria == null
+                    ? Criteria.where("category").is(category)
+                    : criteria.and(Criteria.where("category").is(category));
+        }
+        if (rating != null) {
+            criteria = criteria == null
+                    ? Criteria.where("rating").is(rating)
+                    : criteria.and(Criteria.where("rating").is(rating));
+        }
+        if (visible != null) {
+            criteria = criteria == null
+                    ? Criteria.where("visible").is(visible)
+                    : criteria.and(Criteria.where("visible").is(visible));
+        }
 
-            if (title != null) {
-                predicates.add(
-                        cb.like(
-                                cb.lower(root.get("title")),
-                                "%" + title.toLowerCase() + "%"
-                        )
-                );
-            }
+        if (criteria == null) {
+            return StreamSupport.stream(searchRepository.findAll().spliterator(), false)
+                    .map(this::mapDocumentToDTO)
+                    .toList();
+        }
 
-            if (author != null) {
-                predicates.add(
-                        cb.like(
-                                cb.lower(root.get("author")),
-                                "%" + author.toLowerCase() + "%"
-                        )
-                );
-            }
+        return elasticsearchOperations.search(
+                new CriteriaQuery(criteria),
+                BookDocument.class
+        ).stream()
+         .map(SearchHit::getContent)
+         .map(this::mapDocumentToDTO)
+         .toList();
+    }
 
-            if (isbn != null) {
-                predicates.add(cb.equal(root.get("isbn"), isbn));
-            }
+    @Override
+    public void reindex() {
+        repository.findAll().forEach(this::indexBook);
+    }
 
-            if (category != null) {
-                predicates.add(cb.equal(root.get("category"), category));
-            }
+    private void indexBook(Book book) {
+        searchRepository.save(mapToDocument(book));
+    }
 
-            if (rating != null) {
-                predicates.add(cb.equal(root.get("rating"), rating));
-            }
+    private BookDocument mapToDocument(Book book) {
+        BookDocument doc = new BookDocument();
+        doc.setId(book.getId());
+        doc.setTitle(book.getTitle());
+        doc.setAuthor(book.getAuthor());
+        doc.setIsbn(book.getIsbn());
+        doc.setPrice(book.getPrice() != null ? book.getPrice().doubleValue() : null);
+        doc.setStock(book.getStock());
+        doc.setCategory(book.getCategory());
+        doc.setPublicationYear(book.getPublicationYear());
+        doc.setRating(book.getRating());
+        doc.setVisible(book.getVisible());
+        return doc;
+    }
 
-            if (visible != null) {
-                predicates.add(cb.equal(root.get("visible"), visible));
-            }
-
-            return cb.and(predicates.toArray(new Predicate[0]));
-        }).stream()
-          .map(this::mapToDTO)
-          .toList();
+    private BookDTO mapDocumentToDTO(BookDocument doc) {
+        BookDTO dto = new BookDTO();
+        dto.setId(doc.getId());
+        dto.setTitle(doc.getTitle());
+        dto.setAuthor(doc.getAuthor());
+        dto.setIsbn(doc.getIsbn());
+        dto.setPrice(doc.getPrice() != null ? java.math.BigDecimal.valueOf(doc.getPrice()) : null);
+        dto.setStock(doc.getStock());
+        dto.setCategory(doc.getCategory());
+        dto.setPublicationDate(doc.getPublicationYear() != null ? LocalDate.of(doc.getPublicationYear(), 1, 1) : null);
+        dto.setRating(doc.getRating());
+        dto.setVisible(doc.getVisible());
+        return dto;
     }
 
 
@@ -175,7 +233,7 @@ public class BookServiceImpl implements BookService {
         dto.setPrice(book.getPrice());
         dto.setStock(book.getStock());
         dto.setCategory(book.getCategory());
-        dto.setPublicationDate(book.getPublicationDate());
+        dto.setPublicationDate(book.getPublicationYear() != null ? LocalDate.of(book.getPublicationYear(), 1, 1) : null);
         dto.setRating(book.getRating());
         dto.setVisible(book.getVisible());
         return dto;
@@ -185,13 +243,13 @@ public class BookServiceImpl implements BookService {
         Book book = new Book();
         book.setTitle(dto.getTitle());
         book.setAuthor(dto.getAuthor());
-        book.setIsbn(dto.getIsbn());
+        book.setIsbn(dto.getIsbn() != null && !dto.getIsbn().isBlank() ? dto.getIsbn().trim() : null);
         book.setPrice(dto.getPrice() != null ? dto.getPrice() : java.math.BigDecimal.ZERO);
         book.setStock(dto.getStock() != null ? dto.getStock() : 0);
         book.setCategory(dto.getCategory());
-        book.setPublicationDate(dto.getPublicationDate());
+        book.setPublicationYear(dto.getPublicationDate() != null ? dto.getPublicationDate().getYear() : null);
         book.setRating(dto.getRating());
-        book.setVisible(dto.getVisible());
+        book.setVisible(dto.getVisible() != null ? dto.getVisible() : Boolean.TRUE);
         return book;
     }
 }

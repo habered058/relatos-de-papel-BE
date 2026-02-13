@@ -10,6 +10,7 @@ import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.server.RequestPath;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
@@ -45,6 +46,10 @@ public class ProxyInversoGatewayFilter implements org.springframework.cloud.gate
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, org.springframework.cloud.gateway.filter.GatewayFilterChain chain) {
         String path = exchange.getRequest().getPath().value();
+
+        if (HttpMethod.OPTIONS.equals(exchange.getRequest().getMethod())) {
+            return chain.filter(exchange);
+        }
 
         if (!PROXY_ACTION_PATHS.contains(path)) {
             return chain.filter(exchange);
@@ -115,6 +120,7 @@ public class ProxyInversoGatewayFilter implements org.springframework.cloud.gate
                     try {
                         byte[] bodyBytes = objectMapper.writeValueAsBytes(parsed.getBody());
                         headers.setContentLength(bodyBytes.length);
+                        headers.setContentType(MediaType.APPLICATION_JSON);
                     } catch (Exception ignored) { }
                 }
                 return headers;
